@@ -1,10 +1,7 @@
 import java.io.IOException;
 import java.net.*;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Base64;
-import java.util.Objects;
+import java.util.*;
 
 public class Main {
     static class ULEB128 {
@@ -116,8 +113,8 @@ public class Main {
 
             return new Payload(
                     Arrays.copyOfRange(binaryArray, 0, endFirstArray),
-                    Arrays.copyOfRange(binaryArray, 2, endSecondArray),
-                    Arrays.copyOfRange(binaryArray, 4, endThirdArray),
+                    Arrays.copyOfRange(binaryArray, endFirstArray, endSecondArray),
+                    Arrays.copyOfRange(binaryArray, endSecondArray, endThirdArray),
                     binaryArray[endThirdArray],
                     binaryArray[endThirdArray + 1],
                     Arrays.copyOfRange(binaryArray, endThirdArray + 2, binaryArray.length)
@@ -160,6 +157,15 @@ public class Main {
         public int getCode() {
             return code;
         }
+
+        public static CommandType fromCode(int commandCode) {
+            for (CommandType commandType : CommandType.values()) {
+                if (commandType.getCode() == commandCode) {
+                    return commandType;
+                }
+            }
+            return null;
+        }
     }
 
     record Device(String devName, byte[] devProps) {
@@ -197,13 +203,12 @@ public class Main {
         // Lamp class implementation here
     }
 
-    public class Socket {
-        // Socket class implementation here
-    }
-
+    private static final String HUB_NAME = "HUB01";
+    private static URL SERVER_URL;
     private static int DeviceAddress;
     private static int SerialNumber = 1;
-    private static final ArrayList<Packet> Packets = new ArrayList<>();
+    private static int LampID = -1;
+    private static final List<Packet> Packets = new ArrayList<>();
 
     public static void main(String[] args) {
         if (args.length < 2) {
@@ -211,47 +216,62 @@ public class Main {
             return;
         }
 
-        String URL = args[0];
-        DeviceAddress = Integer.parseInt(args[1], 16);
-
         try {
-            Packet initialPacket = getInitialPacket();
-            String encodedData = encodePacket(initialPacket);
+            URI uri = new URI(args[0]);
+            SERVER_URL = uri.toURL();
+            DeviceAddress = Integer.parseInt(args[1], 16);
 
-            // Отправка POST-запроса
-            int responseCode = sendPostRequest(URL, encodedData);
+            Packet mainPacket = formBroadcastPacket(CommandType.WHOISHERE, convertStringToByteArray(HUB_NAME));
+            String encodedMainPacket = encodePacket(mainPacket);
 
-            if (responseCode == 200) {
-                while (!Packets.isEmpty()) {
-                    Packet currentPacket = Packets.get(0);
+            while (true) {
+                int responseCode = sendPostRequest(SERVER_URL, encodedMainPacket, true);
 
-                    processData(currentPacket);
+                if (responseCode == 200) {
+                    while (!Packets.isEmpty()) {
+                        Packet currentPacket = Packets.get(0);
 
-                    Packets.remove(currentPacket);
+                        processData(currentPacket);
+
+                        Packets.remove(currentPacket);
+                    }
+                } else if (responseCode == 204) {
+                    System.exit(0);
+                } else {
+                    System.exit(99);
                 }
-            } else if (responseCode == 204) {
-                System.exit(0);
-            } else {
-                System.exit(99);
+
+                Thread.sleep(1000);
             }
-        } catch (IOException e) {
+        } catch (IOException | URISyntaxException | InterruptedException e) {
+            System.out.println("Exception generated: " + e);
             System.exit(99);
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
-    private static Packet getInitialPacket() throws IOException {
-        Payload payload = new Payload(
+    private static Packet formPacket(byte[] destinationId, DeviceType deviceType, CommandType commandType, byte[] commandBody) {
+        byte[] payloadByteArray = new Payload(
+                ULEB128.encode(DeviceAddress),
+                destinationId,
+                ULEB128.encode(SerialNumber++),
+                (byte) deviceType.code,
+                (byte) commandType.code,
+                commandBody
+        ).getRawByteArray();
+
+        return new Packet((byte) payloadByteArray.length, payloadByteArray, computeCRC8(payloadByteArray));
+    }
+
+    private static Packet formBroadcastPacket(CommandType commandType, byte[] commandBody) {
+        byte[] payloadByteArray = new Payload(
                 ULEB128.encode(DeviceAddress),
                 ULEB128.encode(16383),
                 ULEB128.encode(SerialNumber++),
                 (byte) DeviceType.SmartHub.code,
-                (byte) CommandType.WHOISHERE.code,
-                new byte[]{0}
-        );
+                (byte) commandType.code,
+                commandBody
+        ).getRawByteArray();
 
-        byte[] payloadByteArray = payload.getRawByteArray();
         return new Packet((byte) payloadByteArray.length, payloadByteArray, computeCRC8(payloadByteArray));
     }
 
@@ -259,10 +279,8 @@ public class Main {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(packet.getRawByteArray());
     }
 
-    private static int sendPostRequest(String url, String encodedData) throws IOException, URISyntaxException {
-        URI uri = new URI(url);
-        URL postUrl = uri.toURL();
-        HttpURLConnection connection = (HttpURLConnection) postUrl.openConnection();
+    private static int sendPostRequest(URL serverUrl, String encodedData, boolean isAdding) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) serverUrl.openConnection();
 
         // Настройка соединения
         connection.setRequestMethod("POST");
@@ -277,8 +295,10 @@ public class Main {
 
         // Получение кода ответа
         int responseCode = connection.getResponseCode();
-        String responseData = new String(connection.getInputStream().readAllBytes());
-        Packets.addAll(Packet.fetchRawPackets(Base64.getUrlDecoder().decode(responseData)));
+        if (isAdding) {
+            String responseData = new String(connection.getInputStream().readAllBytes());
+            Packets.addAll(Packet.fetchRawPackets(Base64.getUrlDecoder().decode(responseData)));
+        }
 
         // Закрытие соединения
         connection.disconnect();
@@ -286,27 +306,36 @@ public class Main {
         return responseCode;
     }
 
-    private static void processData(Packet packet) {
-        switch (Objects.requireNonNull(DeviceType.fromCode(Payload.fromBinary(packet.payload).devType))) {
-            case SmartHub -> {
-                return;
-            }
-            case EnvSensor -> {
-                return;
+    private static void processData(Packet packet) throws IOException, URISyntaxException {
+        Payload currentPacketPayload = Payload.fromBinary(packet.payload);
+
+        switch (Objects.requireNonNull(DeviceType.fromCode(currentPacketPayload.devType))) {
+            case SmartHub, EnvSensor, Socket, Clock -> {
             }
             case Switch -> {
-                return;
+                if (Objects.requireNonNull(CommandType.fromCode(currentPacketPayload.cmd)) == CommandType.STATUS && LampID != -1) {
+                    Packet requestPacket = formPacket(ULEB128.encode(LampID), DeviceType.Lamp, CommandType.SETSTATUS, currentPacketPayload.cmdBody);
+                    sendPostRequest(SERVER_URL, encodePacket(requestPacket), false);
+                }
+                else {
+                    Packet requestPacket = formPacket(currentPacketPayload.src, DeviceType.Switch, CommandType.GETSTATUS, new byte[] {});
+                    sendPostRequest(SERVER_URL, encodePacket(requestPacket), false);
+                }
             }
             case Lamp -> {
-                return;
-            }
-            case Socket -> {
-                return;
-            }
-            case Clock -> {
-                return;
+                LampID = ULEB128.decode(currentPacketPayload.src);
             }
         }
+    }
+
+    private static byte[] convertStringToByteArray(String input) {
+        byte[] bytes = input.getBytes();
+        byte[] result = new byte[bytes.length + 1];
+
+        result[0] = (byte) bytes.length;
+        System.arraycopy(bytes, 0, result, 1, bytes.length);
+
+        return result;
     }
 
     private static byte computeCRC8(byte[] bytes) {
